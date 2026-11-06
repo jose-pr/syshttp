@@ -51,9 +51,17 @@ aiohttp = "syshttp.autopatch"
 # A JavaScript engine for PAC scripts proxylib evaluates itself (Linux without
 # libproxy); Windows and macOS evaluate PAC in the OS.
 pac = ["proxylib[pac]>=2.0.2,<3"]
+# Negotiate and NTLM authentication (syshttp.negotiate): SSPI on Windows with the
+# logon session, GSSAPI where `gssapi` is installed (the `kerberos` extra), and
+# NTLM in Python elsewhere.
+negotiate = ["pyspnego>=0.12.0,<0.13"]
+# Kerberos from the credential cache on Linux and macOS: pyspnego's GSSAPI
+# support, which builds against the system's Kerberos headers (krb5-devel,
+# libkrb5-dev) when no wheel exists.
+kerberos = ["pyspnego[kerberos]>=0.12.0,<0.13"]
 # requests, httpx and aiohttp are what syshttp.autopatch patches: the tests
 # use them. syshttp's own client needs none of them.
-dev = ["requests", "httpx", "aiohttp", "build", "pytest", "black", "mypy<2", "types-requests"]
+dev = ["requests", "httpx", "aiohttp", "build", "pytest", "black", "mypy<2", "types-requests", "syshttp[negotiate]"]
 docs = ["mkdocs", "mkdocs-material", "mkdocstrings[python]"]
 
 [project.urls]
@@ -80,6 +88,12 @@ line-length = 120
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
-# Warnings are errors. An exception would be listed here as narrowly as the
-# warning's own text, with the reason it is tolerated; there are none.
-filterwarnings = ["error"]
+# Warnings are errors. An exception is listed here as narrowly as the warning's
+# own text, with the reason it is tolerated.
+filterwarnings = [
+    "error",
+    # cryptography, the cipher library of pyspnego, says so at import when its
+    # OpenSSL has no legacy provider (a Windows ARM64 Python ships none). NTLM
+    # needs RC4, which lives there: the tests that need it probe for it and skip.
+    "ignore:OpenSSL 3's legacy provider failed to load:Warning",
+]

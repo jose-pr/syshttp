@@ -7,7 +7,7 @@ self-contained. Development documentation lives with the source at
 <https://github.com/jose-pr/syshttp>.
 
 Import names from their modules: `syshttp.env`, `syshttp.proxy`,
-`syshttp.client`, `syshttp.jar`, `syshttp.cookies`, `syshttp.hooks`,
+`syshttp.client`, `syshttp.negotiate`, `syshttp.jar`, `syshttp.cookies`, `syshttp.hooks`,
 `syshttp.tls`, `syshttp.retry`, `syshttp.auth`, `syshttp.exceptions`,
 `syshttp.autopatch`. Each declares `__all__`: a name outside it is not API,
 and a module whose name starts with `_` is private. The root re-exports
@@ -19,9 +19,11 @@ module.
 `pip install syshttp` brings proxylib 2.0.2+ (proxy routing and the system's proxy configuration),
 sslcontext (the system's TLS client; truststore on Python 3.10+) and
 importpatch (import-time patching of other HTTP clients, off unless
-`SYSHTTP_IMPORTPATCH` asks for it). The extra `pac`
+`SYSHTTP_IMPORTPATCH` asks for it). The extras: `pac`
 adds a JavaScript engine for PAC scripts proxylib evaluates itself (Linux
-without libproxy). The client needs nothing else: `requests` is no dependency
+without libproxy); `negotiate` adds pyspnego for Negotiate and NTLM
+(`syshttp.negotiate`); `kerberos` adds `gssapi` to it for the Kerberos
+credential cache on Linux and macOS. The client needs nothing else: `requests` is no dependency
 of any feature; only `syshttp.autopatch` touches it, in a program that imports
 it, when `SYSHTTP_IMPORTPATCH` asks for it.
 
@@ -175,7 +177,8 @@ class HTTPClient:
                  cookies: bool | str | CookieJar | None = False, tokens: bool | str | TokenJar | None = False,
                  auth_provider: AuthProvider | None = None, retries: int = 3, backoff: float = 1,
                  status_forcelist: Iterable[int] = TRANSIENT_STATUSES,
-                 cookie_hosts: Iterable[Iterable[str]] | None = None)
+                 cookie_hosts: Iterable[Iterable[str]] | None = None,
+                 negotiate: Negotiate | None = None)
     transport                                   # the transport in use
     def request(self, method, url, *, data=None, headers=None, stream=False, allow_redirects=None,
                 timeout=..., deadline=..., auth=None) -> HTTPResponse
@@ -319,6 +322,11 @@ DEFAULT_TRANSPORT = "SYSHTTP_DEFAULT_TRANSPORT"      # setting names
   is used instead of sending. A request a provider or a hook makes through the
   client runs neither again; the guard is per thread, so another thread's
   requests still run them.
+- **Negotiate and NTLM.** `negotiate=` (a `syshttp.negotiate.Negotiate`, see
+  its section) configures the default transport as `proxymap` does: a transport
+  of your own, or `SYSHTTP_DEFAULT_TRANSPORT`, beside it is refused. Without
+  it the transport reads `SYSHTTP_NEGOTIATE` and its kin, which name no host by
+  default.
 - **Retries.** A status in `status_forcelist` (default `TRANSIENT_STATUSES`),
   or a failed connection (`ConnectionError`, not a timeout, not
   `NoReachableProxyError`), is sent again up to `retries` times (default 3) for
@@ -433,7 +441,8 @@ class PreparedRequest(NamedTuple):
 def prepare_request(method, url, *, headers, body=None, timeout) -> PreparedRequest
 
 class HTTPTransport:
-    def __init__(self, *, proxymap=None, env=None, ssl_context=None, proxy_ssl_context=None, verify=True)
+    def __init__(self, *, proxymap=None, env=None, ssl_context=None, proxy_ssl_context=None, verify=True,
+                 negotiate: Negotiate | None = None)
     def send(self, method, url, *, headers, body=None, timeout, stream=False) -> HTTPResponse
     def close(self) -> None
 ```
@@ -504,7 +513,102 @@ process using syshttp.
   unless it implements them; it can still be used by `fetch(transport=...)`.
   `HTTPTransport` adds to the contract's exceptions
   `proxylib.NoReachableProxyError`, `proxylib.UnsupportedProxyError` and
-  `ConfigurationError`.
+  `ConfigurationError`, and `NegotiationError` or `NegotiateUnavailableError`
+  for a server or proxy the `negotiate` policy names.
+
+## Negotiate and NTLM (`syshttp.negotiate`)
+
+```python
+class Negotiate:
+    def __init__(self, hosts: str | Iterable[str] | None = None, proxies: str | Iterable[str] | None = None, *,
+                 username: str | None = None, password: str | None = None, plain_http: bool | None = None,
+                 max_legs: int | None = None, max_token: int | None = None, env: HTTPEnv | None = None) -> None
+    def settings(self) -> NegotiateSettings
+    def wants(self, host: str, *, proxy: bool = False) -> bool
+
+@dataclass(frozen=True)
+class NegotiateSettings: hosts: tuple[str, ...]; proxies: tuple[str, ...]; plain_http: bool; max_legs: int; max_token: int; explicit_credentials: bool
+
+def has_negotiate() -> bool
+DEFAULT_MAX_LEGS = 5; DEFAULT_MAX_TOKEN = 65536
+NEGOTIATE = "SYSHTTP_NEGOTIATE"; PROXY_NEGOTIATE = "SYSHTTP_PROXY_NEGOTIATE"
+NEGOTIATE_USER = "SYSHTTP_NEGOTIATE_USER"; NEGOTIATE_PASSWORD = "SYSHTTP_NEGOTIATE_PASSWORD"
+NEGOTIATE_PLAIN_HTTP = "SYSHTTP_NEGOTIATE_PLAIN_HTTP"
+NEGOTIATE_MAX_LEGS = "SYSHTTP_NEGOTIATE_MAX_LEGS"; NEGOTIATE_MAX_TOKEN = "SYSHTTP_NEGOTIATE_MAX_TOKEN"   # setting names
+```
+
+`pip install "syshttp[negotiate]"` (pyspnego) is the one dependency; `kerberos`
+adds `gssapi` for the credential cache on Linux and macOS. `import syshttp`,
+`syshttp.negotiate` and `syshttp.client` import neither; pyspnego is imported
+at the first handshake.
+
+- **Off by default.** `HTTPTransport(negotiate=...)` and
+  `HTTPClient(negotiate=...)` take a `Negotiate`; with none given the transport
+  uses `Negotiate(env=env)`. A `401` with `WWW-Authenticate: Negotiate` or `NTLM`
+  and a `407` with `Proxy-Authenticate` are answered only for a host the policy
+  names; any other is the reply, as for any client. `hosts` (else
+  `SYSHTTP_NEGOTIATE`) names servers and `proxies` (else `SYSHTTP_PROXY_NEGOTIATE`)
+  proxies, by the host of the proxy: a comma list or an iterable of host names,
+  `*.suffix` for every host below a domain (not the domain), `*` for all; an
+  empty list is none and beats the variable. A host name is compared without
+  case, brackets or a trailing dot.
+- **The exchange.** The transport sends the same request again with `Authorization:
+  <Negotiate|NTLM> <base64 token>` (`Proxy-Authorization` for a proxy) on the
+  connection the challenge came on, with `Connection: keep-alive`, until the reply
+  is not the challenge again; `Negotiate` is preferred when a reply offers
+  both. A `CONNECT` the proxy answers `407` is answered the same way, on the
+  proxy connection, before the tunnel is made; a proxy's challenge is
+  answered before a server's, each once. The body of a challenge is read (up to
+  64 KiB) and dropped; the reply that follows is what `send()` returns, and
+  the connection, now authenticated, goes back to the pool. The server's
+  closing token is taken from that reply when the mechanism proves the server
+  (Kerberos): a reply of 400 or more is returned unchecked; an incomplete
+  exchange with no closing token, or one the token does not complete, is
+  `NegotiationError`; NTLM has none.
+- **Not answered** (the reply is returned): the request names an `Authorization`
+  (a `Proxy-Authorization` for a proxy challenge), the proxy has a credential of
+  its own (userinfo, headers), the body cannot be sent twice (a file, an
+  iterable), the route is a prefix gateway, or the reply offers neither scheme. A
+  plain-http server behind a proxy that also challenges is answered after the
+  proxy, but the proxy's token is not repeated on the server's legs: a
+  Kerberos proxy asks again and its `407` is returned. A transport of your own
+  does its own authentication.
+- **Identity.** `username` and `password` (else `SYSHTTP_NEGOTIATE_USER` and
+  `SYSHTTP_NEGOTIATE_PASSWORD`, both or `ConfigurationError`) are one identity
+  for every host the policy names, as `DOMAIN\user` or `user@REALM`; with none,
+  the Windows logon session (SSPI) or the Kerberos credential cache. The
+  password is a secret held by the object and in no `repr()`, message, log
+  line or exception attribute; `repr(Negotiate)` says `credentials=explicit`
+  or `logon`, `NegotiateSettings` holds `explicit_credentials`, never the
+  identity. A caller's bad argument is `ValueError` or `TypeError` (a half
+  identity, a line break in either part, `max_legs` below 1, a host that is not a
+  name or pattern); a variable that cannot be used is `ConfigurationError`
+  naming it, refused when the transport is made.
+- **Plain http.** A handshake over `http:` (the server's scheme; for a proxy
+  challenge the proxy URL's) to a host that is not `localhost`, `127.0.0.0/8` or
+  `::1` is `NegotiationError` naming `SYSHTTP_NEGOTIATE_PLAIN_HTTP`, before any
+  token is made. `plain_http=True` (else the variable, a boolean) allows it;
+  each such server or proxy is then logged once per transport at WARNING, under
+  `syshttp.client`, as `weakened`. An `https:` server through a proxy is judged
+  by its own scheme.
+- **Limits.** `max_legs` (default 5, `SYSHTTP_NEGOTIATE_MAX_LEGS`) is the most
+  authenticated requests of one handshake: NTLM takes two, Kerberos one or two.
+  `max_token` (default 65536, `SYSHTTP_NEGOTIATE_MAX_TOKEN`) is the most
+  bytes of a token, sent or received. Past either: `NegotiationError`, and
+  nothing more is sent.
+- **Failures.** `NegotiationError` (message: the host and port, the
+  mechanism, never a token or a credential): the credentials refused (the
+  challenge again), a challenge answered with a token that is not valid
+  base64, a server that closes the connection or sends more than 64 KiB between
+  legs, a limit, the library's own failure (`__cause__`), a refusal over plain
+  http. `NegotiateUnavailableError` (also `ImportError`): pyspnego is
+  missing or does not import, naming `pip install "syshttp[negotiate]"`; raised
+  only for a host the policy names. A handshake is never sent again by
+  syshttp: `NegotiationError` is not a `ConnectionError`, so the client's retries
+  do not repeat it.
+- **Channel binding** (Extended Protection for Authentication) is not sent: a
+  server that requires it refuses the exchange. `has_negotiate()` is whether
+  pyspnego imports.
 
 ## Exceptions (`syshttp.exceptions`)
 
@@ -513,6 +617,8 @@ class SysHTTPError(Exception)
 class ConfigurationError(SysHTTPError, ValueError)
 class HookError(SysHTTPError, RuntimeError)
 class ResponseError(SysHTTPError, ValueError)
+class NegotiationError(SysHTTPError)
+class NegotiateUnavailableError(NegotiationError, ImportError)
 ```
 
 - `SysHTTPError` is the base of what goes wrong at run time. proxylib's own
@@ -524,6 +630,10 @@ class ResponseError(SysHTTPError, ValueError)
   `SYSHTTP_PREFIX`). The message names the variable or key, never a secret.
 - `HookError`: a `_PY` hook failed; the hook's own exception is `__cause__`.
 - `ResponseError`: a body that is not the JSON `HTTPResponse.json()` was asked for.
+- `NegotiationError`: a Negotiate or NTLM handshake that did not authenticate
+  (see "Negotiate and NTLM"); `NegotiateUnavailableError` is the one raised when
+  pyspnego is missing or does not import, naming the `negotiate` extra. The
+  message names the host, never a token or a credential.
 - A caller's own mistake is a plain `ValueError` or `TypeError`, not one of
   these: a malformed `prefixes=` argument, `verify=False` beside `ssl_context`,
   a `client` beside `client_options` in `fetch()`, an unknown patch target.
@@ -776,6 +886,13 @@ def patched() -> tuple[str, ...]
 | `HTTP_PROXY_AUTH` | **secret**: the machine's proxy's credential (a `*_PROXY` variable's or the system's), as `Proxy-Authorization` | the URL's userinfo as Basic |
 | `SYSHTTP_PROXY_AUTH_HEADER` | the header name `SYSHTTP_PROXY_AUTH` rides in | `Proxy-Authorization` |
 | `SYSHTTP_PROXY_TYPE` | `connect` or `prefix[:/endpoint]` | `connect` |
+| `SYSHTTP_NEGOTIATE` | the servers whose Negotiate or NTLM challenge is answered: comma list of host names, `*.suffix`, `*` | none |
+| `SYSHTTP_PROXY_NEGOTIATE` | the same for proxies, by the proxy's host | none |
+| `SYSHTTP_NEGOTIATE_USER` | the explicit identity's name, `DOMAIN\user` or `user@REALM` (with `_PASSWORD`) | the logon session or credential cache |
+| `SYSHTTP_NEGOTIATE_PASSWORD` | **secret**: the explicit identity's password | none |
+| `SYSHTTP_NEGOTIATE_PLAIN_HTTP` | boolean: authenticate over plain http to a host that is not loopback (logged as a weakening) | off |
+| `SYSHTTP_NEGOTIATE_MAX_LEGS` | most authenticated requests of one handshake | 5 |
+| `SYSHTTP_NEGOTIATE_MAX_TOKEN` | most bytes of one token, sent or received | 65536 |
 | `SYSHTTP_HOME` | the jar root | the per-user state directory |
 | `SYSHTTP_COOKIE_HOSTS` | groups of hosts that share cookies: hosts split by `,`, groups by `;` (`HTTPClient`) | none |
 | `SYSHTTP_DEFAULT_TRANSPORT` | the transport of an `HTTPClient` (and `fetch()`) given none: `module:attr` or `<file>.py:attr`, an object with `send()` or something that makes one. It names code to import | syshttp's `HTTPTransport` |
@@ -815,3 +932,15 @@ proxylib's own `PROXYLIB_IMPORTPATCH` and `PROXYLIB_AUTOPROXY`.
   an untrusted party set the environment of a process using syshttp.
 - A client keeps the cookies its responses set for its whole life, as a
   session does: build one per identity, or pass `cookies=` a jar of its own.
+- Negotiate and NTLM send nothing until `SYSHTTP_NEGOTIATE` or
+  `SYSHTTP_PROXY_NEGOTIATE` (or a `Negotiate(hosts=...)`) names the host: the
+  logon identity is released only to hosts you list, never to whatever
+  challenges. Over plain http, to anything but loopback, it needs
+  `SYSHTTP_NEGOTIATE_PLAIN_HTTP` as well.
+- In a venv of the Windows ARM64 CPython 3.9 and 3.14 tested (cryptography
+  50.0.2, pyspnego 0.12.4), `import spnego` fails with "DLL load failed" until
+  the interpreter's `DLLs` directory is on the DLL search path
+  (`os.add_dll_directory`), and then warns that OpenSSL's legacy provider did
+  not load, which leaves pyspnego's own NTLM without RC4; SSPI, once the import
+  works, does not need it. `has_negotiate()` is the probe, and a handshake that
+  needs what is missing is `NegotiationError` or `NegotiateUnavailableError`.

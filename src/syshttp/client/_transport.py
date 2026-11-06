@@ -17,7 +17,9 @@ import proxylib
 
 from .. import proxy as _proxy
 from ..env import HTTPEnv
-from . import _pool, _route
+from ..exceptions import NegotiationError
+from ..negotiate import NEGOTIATE_PLAIN_HTTP, Negotiate, NegotiateSettings, is_loopback
+from . import _handshake, _pool, _route
 from ._body import prepare_body
 from ._context import TLSChoice
 from ._headers import (
@@ -126,6 +128,10 @@ def _unusable(sock) -> bool:
     except (OSError, ValueError):
         return True
 
+
+_DRAIN = 64 * 1024
+"""Most bytes read from the body of a challenge, which is dropped so the
+connection can carry the next leg."""
 
 MAX_INTERIM_REPLIES = 8
 """Most interim (1xx) replies the transport skips before the reply it returns;
@@ -293,7 +299,18 @@ class HTTPTransport:
     the server had closed it is sent once more on a new connection, but only
     if it is repeatable (`GET`, `HEAD`, `OPTIONS`, `PUT`, `DELETE`,
     `PROPFIND`) and its body is `None` or in memory. Any other request reuses a
-    connection only if it carried a response within the last second."""
+    connection only if it carried a response within the last second.
+
+    **Negotiate and NTLM.** For a server or proxy that `negotiate` (default
+    `Negotiate(env=env)`: nothing unless `SYSHTTP_NEGOTIATE` or
+    `SYSHTTP_PROXY_NEGOTIATE` name it) allows, a `401` with `WWW-Authenticate:
+    Negotiate` or `NTLM`, or a `407` with `Proxy-Authenticate`, is answered on
+    the same connection, leg after leg, and `send()` returns the reply that
+    follows; a `CONNECT` the proxy challenges is answered the same way. It is
+    skipped when the request names an `Authorization` (a `Proxy-Authorization`
+    for a proxy), when the proxy has a credential of its own, when the body
+    cannot be sent twice and for a gateway. A handshake that fails is
+    `NegotiationError`; the `negotiate` extra missing, `NegotiateUnavailableError`."""
 
     def __init__(
         self,
@@ -303,8 +320,15 @@ class HTTPTransport:
         ssl_context: "_ssl.SSLContext | None" = None,
         proxy_ssl_context: "_ssl.SSLContext | None" = None,
         verify: "bool | str | _os.PathLike[str]" = True,
+        negotiate: "Negotiate | None" = None,
     ):
         self._env = HTTPEnv() if env is None else env
+        if negotiate is not None and not isinstance(negotiate, Negotiate):
+            raise TypeError("negotiate is a syshttp.negotiate.Negotiate")
+        self._negotiate = Negotiate(env=self._env) if negotiate is None else negotiate
+        self._negotiate.settings()  # a variable that cannot be used is refused now
+        self._weakened: "set[tuple[str, str]]" = set()
+        self._weakened_lock = _threading.Lock()
         self._tls = TLSChoice(self._env, ssl_context, proxy_ssl_context, verify)
         if proxymap is None:
             # Decided at every request; a malformed setting is refused now.
@@ -463,9 +487,9 @@ class HTTPTransport:
         http = connection.http
         wire = route.wire
         line = f"http://{wire.authority}{wire.path}" if route.proxy is not None and wire.scheme == "http" else wire.path
+        sent = self._headers(route, pairs, names, payload)
         try:
-            http.request(method, line, body=payload.value, headers=self._headers(route, pairs, names, payload))
-            response = http.getresponse()
+            response = self._roundtrip(http, method, line, payload, sent)
         except (OSError, _client.HTTPException) as error:
             self._pool.discard(connection)
             if reused and _dropped(error):
@@ -474,9 +498,123 @@ class HTTPTransport:
         except BaseException:
             self._pool.discard(connection)
             raise
+        if response.status in (401, 407):
+            try:
+                response = self._authenticated(http, route, method, line, payload, sent, names, response)
+            except (OSError, _client.HTTPException) as error:
+                self._pool.discard(connection)
+                raise _failure(error) from None
+            except BaseException:
+                self._pool.discard(connection)
+                raise
         headers = response.getheaders()
         body = _Body(self, self._pool, connection, response, response.length)
         return HTTPResponse(response.status, response.reason, headers, url, body, decode=decode)
+
+    @staticmethod
+    def _roundtrip(http, method: str, line: str, payload: _Payload, sent: "dict[str, str]"):
+        http.request(method, line, body=payload.value, headers=sent)
+        return http.getresponse()
+
+    # -- Negotiate and NTLM
+
+    def _applies(self, route: _Route, names, payload: _Payload, response, proxy: bool) -> "NegotiateSettings | None":
+        """The settings when `response`, a 401 (or a 407 when `proxy`), is a
+        challenge this transport answers, else `None`: the request chose its
+        own credential, the route has none to answer for, the policy does not
+        name the host, or the request cannot be sent again."""
+        owner = route.proxy if proxy else None
+        if route.gateway is not None or (proxy and owner is None):
+            return None
+        if _handshake.offered(response.getheaders(), (_handshake.PROXY if proxy else _handshake.SERVER)[0]) is None:
+            return None
+        if not proxy and "authorization" in names:
+            return None
+        if proxy and ("proxy-authorization" in names or (owner is not None and _route.credentials(owner))):
+            return None
+        host = owner.host if owner is not None else route.wire.host
+        if not self._negotiate.wants(host, proxy=proxy):
+            return None
+        if not payload.repeatable:
+            return None
+        settings = self._negotiate.settings()
+        self._check_plain(settings, host, owner.scheme if owner is not None else route.wire.scheme, owner is not None)
+        return settings
+
+    def _check_plain(self, settings: NegotiateSettings, host: str, scheme: str, proxy: bool) -> None:
+        """Refuses a handshake over plain http to a host that is not loopback
+        unless `SYSHTTP_NEGOTIATE_PLAIN_HTTP` allows it, which is logged as a
+        weakening once for each host."""
+        if scheme != "http" or is_loopback(host):
+            return
+        if not settings.plain_http:
+            raise NegotiationError(
+                "Negotiate with the %s %s is not tried over plain http: set %s to allow it"
+                % ("proxy" if proxy else "server", host, self._env.name(NEGOTIATE_PLAIN_HTTP))
+            )
+        key = ("proxy" if proxy else "server", host)
+        with self._weakened_lock:
+            first = key not in self._weakened
+            self._weakened.add(key)
+        if first:
+            _log.warning(
+                "weakened: Negotiate with the %s %s over plain http (%s is set): its tokens cross the network in clear text",
+                key[0],
+                host,
+                self._env.name(NEGOTIATE_PLAIN_HTTP),
+            )
+
+    @staticmethod
+    def _drain(response, where: str) -> None:
+        """Reads the body of a challenge and closes it, leaving the connection
+        ready for the next leg; `NegotiationError` when the server is closing
+        the connection or the body is too long to read."""
+        if response.will_close:
+            response.close()
+            raise NegotiationError("%s closed the connection during the handshake" % where)
+        body = response.read(_DRAIN + 1)
+        if len(body) > _DRAIN or not response.isclosed():
+            response.close()
+            raise NegotiationError("%s sent a challenge body over %d bytes" % (where, _DRAIN))
+        response.close()
+
+    def _authenticated(self, http, route: _Route, method, line, payload, sent, names, response):
+        """`response`, or when it is a challenge that is answered, the reply
+        that follows the answer, on the same connection. A proxy's challenge
+        comes before a server's; each is answered once."""
+        done: "set[int]" = set()
+        while response.status in (401, 407) and response.status not in done:
+            done.add(response.status)
+            proxy = response.status == 407
+            settings = self._applies(route, names, payload, response, proxy)
+            if settings is None:
+                break
+            owner = route.proxy if proxy else None
+            host = owner.host if owner is not None else route.wire.host
+            port = _route.port(owner) if owner is not None else route.wire.port
+            where = "%s %s:%d" % ("the proxy" if proxy else "the server", host, port)
+            current = [response]
+
+            def send(header: str, value: str, _http=http, _current=current, _where=where) -> _handshake.View:
+                self._drain(_current[0], _where)
+                headers = dict(sent)
+                headers[header] = value
+                if "connection" not in names:
+                    headers["Connection"] = "keep-alive"
+                _current[0] = self._roundtrip(_http, method, line, payload, headers)
+                return _current[0].status, _current[0].getheaders()
+
+            _handshake.authenticate(
+                self._negotiate,
+                settings,
+                host,
+                (response.status, response.getheaders()),
+                send,
+                proxy=proxy,
+                where=where,
+            )
+            response = current[0]
+        return response
 
     def _open(self, route: _Route, scope: int, connect_timeout, read_timeout):
         proxy, wire = route.proxy, route.wire
@@ -532,19 +670,53 @@ class HTTPTransport:
             sock.close()
             raise
 
-    @staticmethod
-    def _tunnel(sock, target: Target, proxy: "proxylib.Proxy") -> None:
+    def _tunnel(self, sock, target: Target, proxy: "proxylib.Proxy") -> None:
         """Asks the proxy to connect `sock` to the server (RFC 9110 9.3.6). Only
-        what the proxy is configured with goes in the request."""
+        what the proxy is configured with goes in the request. A `407` that
+        offers Negotiate or NTLM to a proxy the policy names is answered on this
+        connection, leg after leg."""
         authority = f"{bracket(target.host)}:{target.port}"
         lines = [f"CONNECT {authority} HTTP/1.1", f"Host: {authority}"]
-        lines += [f"{name}: {value}" for name, value in _route.credentials(proxy)]
-        sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
-        reply = _client.HTTPResponse(sock, method="CONNECT")
+        credentials = _route.credentials(proxy)
+        lines += [f"{name}: {value}" for name, value in credentials]
+
+        def connect(extra: "list[str]") -> "_client.HTTPResponse":
+            sock.sendall(("\r\n".join(lines + extra) + "\r\n\r\n").encode("ascii"))
+            reply = _client.HTTPResponse(sock, method="CONNECT")
+            try:
+                reply.begin()
+            except BaseException:
+                reply.close()
+                raise
+            return reply
+
+        current = [connect([])]
         try:
-            reply.begin()
-            status = reply.status
+            if current[0].status == 407 and not credentials:
+                self._answer_connect(current, connect, proxy)
+            status = current[0].status
         finally:
-            reply.close()
+            current[0].close()
         if not 200 <= status < 300:
             raise ConnectionRefusedError(_errno.ECONNREFUSED, f"the proxy refused CONNECT (HTTP {status})")
+
+    def _answer_connect(self, current: list, connect, proxy: "proxylib.Proxy") -> None:
+        """Runs the handshake for a proxy's `407` to `CONNECT`, when the policy
+        names the proxy; `current[0]` ends as the last reply."""
+        reply = current[0]
+        if _handshake.offered(reply.getheaders(), _handshake.PROXY[0]) is None:
+            return
+        if not self._negotiate.wants(proxy.host, proxy=True):
+            return
+        settings = self._negotiate.settings()
+        self._check_plain(settings, proxy.host, proxy.scheme, True)
+        where = "the proxy %s:%d" % (proxy.host, _route.port(proxy))
+
+        def send(header: str, value: str) -> _handshake.View:
+            self._drain(current[0], where)
+            current[0] = connect([f"{header}: {value}", "Connection: keep-alive"])
+            return current[0].status, current[0].getheaders()
+
+        _handshake.authenticate(
+            self._negotiate, settings, proxy.host, (reply.status, reply.getheaders()), send, proxy=True, where=where
+        )

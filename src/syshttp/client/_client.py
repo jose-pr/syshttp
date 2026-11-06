@@ -14,6 +14,7 @@ from .. import __version__
 from .. import hooks as _hooks
 from ..env import HTTPEnv
 from ..jar import CookieJar, TokenJar
+from ..negotiate import Negotiate
 from ..retry import TRANSIENT_STATUSES, retry_after
 from . import _follow, _settings
 from ._deadline import Deadline, check_deadline
@@ -123,6 +124,7 @@ class HTTPClient:
         backoff: float = 1,
         status_forcelist: "_ty.Iterable[int]" = TRANSIENT_STATUSES,
         cookie_hosts: "_ty.Iterable[_ty.Iterable[str]] | None" = None,
+        negotiate: "Negotiate | None" = None,
     ):
         if transport is not None and not callable(getattr(transport, "send", None)):
             raise TypeError("a transport is an object with a send() method")
@@ -136,6 +138,7 @@ class HTTPClient:
             "ssl_context": ssl_context,
             "proxy_ssl_context": proxy_ssl_context,
             "verify": verify,
+            "negotiate": negotiate,
         }
         self._transport = transport
         self._built = None
@@ -143,7 +146,7 @@ class HTTPClient:
         if transport is not None:
             if any(value is not (True if name == "verify" else None) for name, value in options.items()):
                 raise ValueError(
-                    "proxymap, ssl_context, proxy_ssl_context and verify configure the default transport: "
+                    "proxymap, ssl_context, proxy_ssl_context, verify and negotiate configure the default transport: "
                     "a client given a transport leaves them to it"
                 )
         else:

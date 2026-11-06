@@ -10,6 +10,8 @@ Public surface (the package's AGENTS.md documents each name):
                                          --noproxy overrides included)
   proxy.configured_proxy / proxy_type  — SYSHTTP_PROXY as a proxylib Proxy; SYSHTTP_PROXY_TYPE
                                          (connect | prefix[:/endpoint])
+  negotiate.Negotiate                  — Negotiate and NTLM for the servers and proxies SYSHTTP_NEGOTIATE /
+                                         SYSHTTP_PROXY_NEGOTIATE name (the `negotiate` extra)
   client.HTTPClient / fetch            — the client: proxy map, system TLS, cookies, tokens,
                                          hooks, retries; replaceable transport. ``fetch`` is
                                          also ``syshttp.fetch``
@@ -32,12 +34,21 @@ from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
 from .env import HTTPEnv
-from .exceptions import ConfigurationError, HookError, ResponseError, SysHTTPError
+from .exceptions import (
+    ConfigurationError,
+    HookError,
+    NegotiateUnavailableError,
+    NegotiationError,
+    ResponseError,
+    SysHTTPError,
+)
 
 __all__ = [
     "ConfigurationError",
     "HTTPEnv",
     "HookError",
+    "NegotiateUnavailableError",
+    "NegotiationError",
     "NoReachableProxyError",
     "ResponseError",
     "SysHTTPError",

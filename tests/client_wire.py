@@ -5,10 +5,16 @@ interface."""
 
 from __future__ import annotations
 
+import base64
+import functools
+import os
 import pathlib
 import select
+import secrets
 import socket
 import ssl
+import sys
+import tempfile
 import threading
 import time
 import typing
@@ -235,6 +241,10 @@ class Wire:
                 else:
                     data = _read_exactly(sock, rest, length)
                     body, carry = data[:length], data[length:]
+                if index is None:
+                    with self._lock:
+                        index = self._connections
+                        self._connections += 1
                 request = Request(method, target, headers, body, index)
                 with self._lock:
                     self.requests.append(request)
@@ -270,12 +280,18 @@ class Proxy:
     answered by `script(request)` as an origin would; `CONNECT host:port` is
     answered `200` and then relayed to `upstream` (a `(host, port)`), whatever
     the host asked for, or refused with `refuse` (a status) when given.
-    `requests` lists what it received, `CONNECT`s included."""
+    `connect_script(request)` sees each `CONNECT` first: what it returns
+    (`bytes` or a `Reply`) is sent and the connection kept for the next
+    request, `None` leaves the `CONNECT` to the tunnel. `requests` lists what it
+    received, `CONNECT`s included, each with the index of its connection (connections
+    that send nothing, such as a probe, have none)."""
 
-    def __init__(self, script=None, upstream=None, refuse=None):
+    def __init__(self, script=None, upstream=None, refuse=None, connect_script=None):
         self.script = script or (lambda request: response(body=b"via proxy"))
         self.upstream = upstream
         self.refuse = refuse
+        self.connect_script = connect_script
+        self._connections = 0
         self.requests: "list[Request]" = []
         self._lock = threading.Lock()
         self._sockets: "list[socket.socket]" = []
@@ -310,6 +326,7 @@ class Proxy:
             threading.Thread(target=self._serve, args=(sock,), daemon=True).start()
 
     def _serve(self, sock):
+        index = None  # numbered at its first request: a probe that sends nothing takes no number
         try:
             while not self._stop.is_set():
                 parsed = _read_until(sock, CRLF + CRLF)
@@ -321,10 +338,23 @@ class Proxy:
                 headers = [(k, v.strip()) for k, v in (l.split(":", 1) for l in lines[1:])]
                 length = next((int(v) for k, v in headers if k.lower() == "content-length"), 0)
                 body = _read_exactly(sock, rest, length)[:length]
-                request = Request(method, target, headers, body, 0)
+                if index is None:
+                    with self._lock:
+                        index = self._connections
+                        self._connections += 1
+                request = Request(method, target, headers, body, index)
                 with self._lock:
                     self.requests.append(request)
                 if method == "CONNECT":
+                    answer = self.connect_script(request) if self.connect_script else None
+                    if answer is not None:
+                        # A challenge: the connection stays open for the next leg.
+                        if isinstance(answer, bytes):
+                            answer = Reply(answer)
+                        sock.sendall(answer.raw)
+                        if answer.close:
+                            return
+                        continue
                     if self.refuse:
                         sock.sendall(response(self.refuse, reason="Refused"))
                         return
@@ -409,3 +439,257 @@ class Authority(typing.NamedTuple):
 
 def loopback_authority() -> Authority:
     return Authority(str(DATA / "ca.pem"), str(DATA / "server.pem"), str(DATA / "server.key"))
+
+
+# --- Negotiate and NTLM -------------------------------------------------------
+#
+# The server half of a handshake runs for real: pyspnego is the acceptor. The
+# client is syshttp's, with credentials made up for the test or, on Windows, the
+# logon session of whoever runs it, against an acceptor in this process:
+# nothing leaves the machine and no domain is asked.
+
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+class Acceptor(typing.NamedTuple):
+    """A way to run the server half of a handshake, and the client credentials
+    that go with it."""
+
+    label: str
+    make: typing.Callable[[str], typing.Any]  # protocol ("ntlm" | "negotiate") -> acceptor context
+    options: "dict[str, typing.Any]"  # keywords of `Negotiate` for the client's identity
+    wrong: "dict[str, typing.Any] | None"  # the same with a password the acceptor refuses; None: no such thing
+
+
+def _exchange(client, server) -> None:
+    token = None
+    for _ in range(8):
+        out = client.step(token)
+        if out is None:
+            break
+        token = server.step(out)
+        if client.complete and server.complete:
+            return
+    if not (client.complete and server.complete):
+        raise RuntimeError("the exchange did not complete")
+
+
+@functools.lru_cache(maxsize=None)
+def pure_ntlm_problem() -> "str | None":
+    """`None` when pyspnego's own NTLM completes a client and an acceptor in
+    this process, else why it cannot (its cipher library may lack RC4)."""
+    try:
+        import spnego
+        from spnego import NegotiateOptions
+    except ImportError as error:
+        return "pyspnego does not import (%s)" % error
+    with tempfile.TemporaryDirectory() as directory:
+        users = pathlib.Path(directory, "users")
+        users.write_text("PROBE:probe:probe-password-1\n")
+        before = os.environ.get("NTLM_USER_FILE")
+        os.environ["NTLM_USER_FILE"] = str(users)
+        try:
+            _exchange(
+                spnego.client(
+                    "PROBE\\probe",
+                    "probe-password-1",
+                    hostname="localhost",
+                    protocol="ntlm",
+                    options=NegotiateOptions.use_ntlm,
+                    context_req=spnego.ContextReq.mutual_auth,
+                ),
+                spnego.server(protocol="ntlm", options=NegotiateOptions.use_ntlm),
+            )
+        except Exception as error:
+            return "pyspnego's own NTLM does not run here (%s: %s)" % (type(error).__name__, error)
+        finally:
+            if before is None:
+                os.environ.pop("NTLM_USER_FILE", None)
+            else:
+                os.environ["NTLM_USER_FILE"] = before
+    return None
+
+
+@functools.lru_cache(maxsize=None)
+def sspi_problem() -> "str | None":
+    """`None` when SSPI completes NTLM between the logon session and an
+    acceptor in this process, else why it cannot."""
+    if sys.platform != "win32":
+        return "SSPI is Windows only"
+    try:
+        import spnego
+        from spnego import NegotiateOptions
+    except ImportError as error:
+        return "pyspnego does not import (%s)" % error
+    try:
+        _exchange(
+            spnego.client(
+                None,
+                None,
+                hostname="localhost",
+                protocol="ntlm",
+                options=NegotiateOptions.use_sspi,
+                context_req=spnego.ContextReq.mutual_auth,
+            ),
+            spnego.server(protocol="ntlm", options=NegotiateOptions.use_sspi),
+        )
+    except Exception as error:
+        return "SSPI NTLM does not run here (%s: %s)" % (type(error).__name__, error)
+    return None
+
+
+def pure_acceptor(users_file) -> Acceptor:
+    """pyspnego's own acceptor with one user whose name and password are made
+    up here and written to `users_file`, its credential store: the caller sets
+    `NTLM_USER_FILE` to that path."""
+    import spnego
+    from spnego import NegotiateOptions
+
+    domain, user, password = "SYSHTTPTEST", "tester", secrets.token_hex(12)
+    pathlib.Path(users_file).write_text("%s:%s:%s\n" % (domain, user, password))
+    name = "%s\\%s" % (domain, user)
+
+    def make(protocol: str):
+        return spnego.server(
+            protocol=protocol,
+            options=NegotiateOptions.use_negotiate if protocol == "negotiate" else NegotiateOptions.use_ntlm,
+            context_req=spnego.ContextReq.mutual_auth,
+        )
+
+    return Acceptor(
+        "pure",
+        make,
+        {"username": name, "password": password},
+        {"username": name, "password": password + "x"},
+    )
+
+
+def sspi_acceptor() -> Acceptor:
+    """An SSPI acceptor in this process. The client is the logon session of the
+    process, with no password to give or to get wrong."""
+    import spnego
+    from spnego import NegotiateOptions
+
+    def make(protocol: str):
+        return spnego.server(protocol=protocol, options=NegotiateOptions.use_sspi)
+
+    return Acceptor("sspi", make, {}, None)
+
+
+class Handshake:
+    """The server half of a Negotiate or NTLM exchange: a `script` for `Wire`
+    (401) or `Proxy` (407), and with `tunnel=True` a `connect_script` for a
+    `CONNECT` that the proxy then tunnels.
+
+    Each connection has an acceptor of its own, as NTLM binds the identity to
+    the connection. A request without a token is challenged, a token is
+    stepped through the acceptor and answered with the next challenge, the
+    request that completes it is served by `ok(request)` (default: `200`), and
+    so is every later request on that connection. `events` lists
+    `(connection, what)` in order: `challenge`, `token`, `done`, `rejected`,
+    `served`; `principals` the names that authenticated.
+
+    `refuse` answers the completing token with a challenge (carrying a token when
+    it is `"token"`), as a server that
+    rejects the credentials does; `close_challenge` sends `Connection: close`
+    with each challenge; `junk` answers a token with a challenge whose token is
+    not base64 (a token of characters that are not in its alphabet)."""
+
+    def __init__(
+        self,
+        acceptor: Acceptor,
+        *,
+        scheme="NTLM",
+        proxy=False,
+        tunnel=False,
+        ok=None,
+        refuse=False,
+        close_challenge=False,
+        junk=False,
+        body=b"authentication required",
+    ):
+        self.acceptor = acceptor
+        self.scheme = scheme
+        self.status, self.challenge, self.answer, self.reason = (
+            (407, "Proxy-Authenticate", "Proxy-Authorization", "Proxy Authentication Required")
+            if proxy
+            else (401, "WWW-Authenticate", "Authorization", "Unauthorized")
+        )
+        self.tunnel = tunnel
+        self.ok = ok
+        self.refuse = refuse
+        self.close_challenge = close_challenge
+        self.junk = junk
+        self.body = body
+        self.events: "list[tuple[int, str]]" = []
+        self.principals: "list[str]" = []
+        self._contexts: "dict[int, typing.Any]" = {}
+        self._done: "set[int]" = set()
+        self._lock = threading.Lock()
+
+    def count(self, what: str) -> int:
+        """How many times `what` happened."""
+        with self._lock:
+            return sum(1 for _, event in self.events if event == what)
+
+    def _note(self, connection: int, what: str) -> None:
+        with self._lock:
+            self.events.append((connection, what))
+
+    def _challenge(self, connection: int, token, what="challenge") -> Reply:
+        value = (
+            self.scheme if token is None else "%s %s" % (self.scheme, token if isinstance(token, str) else _b64(token))
+        )
+        headers = {self.challenge: value, "Connection": "close" if self.close_challenge else "keep-alive"}
+        self._note(connection, what)
+        return Reply(response(self.status, headers, self.body, reason=self.reason), close=self.close_challenge)
+
+    def _served(self, request: Request):
+        self._note(request.connection, "served")
+        if self.tunnel:
+            return None
+        return self.ok(request) if self.ok else response(body=b"authenticated")
+
+    def __call__(self, request: Request):
+        connection = request.connection
+        if connection in self._done:
+            return self._served(request)
+        value = request.header(self.answer)
+        if value is None:
+            return self._challenge(connection, None)
+        scheme, _, token = value.partition(" ")
+        if scheme.lower() != self.scheme.lower():
+            return self._challenge(connection, None)
+        self._note(connection, "token")
+        context = self._contexts.get(connection)
+        if context is None:
+            context = self._contexts[connection] = self.acceptor.make(self.scheme.lower())
+        try:
+            out = context.step(base64.b64decode(token))
+        except Exception:
+            self._contexts.pop(connection, None)
+            return self._challenge(connection, None, "rejected")
+        if self.junk:
+            return self._challenge(connection, "AAAA-_-_")
+        if not context.complete:
+            return self._challenge(connection, out)
+        if self.refuse:
+            self._contexts.pop(connection, None)
+            return self._challenge(connection, b"try again" if self.refuse == "token" else None, "rejected")
+        self._done.add(connection)
+        self._note(connection, "done")
+        self.principals.append(str(getattr(context, "client_principal", "")))
+        served = self._served(request)
+        if out and isinstance(served, bytes):
+            # The server's closing token rides on the reply that succeeds.
+            head, _, rest = served.partition(CRLF)
+            closing = ("%s: %s %s" % (self.challenge, self.scheme, _b64(out))).encode("ascii")
+            served = head + CRLF + closing + CRLF + rest
+        return served
+
+
+IDLE = Acceptor("idle", lambda protocol: None, {}, None)
+"""An acceptor that is never asked: for a test whose server challenges and is
+never answered."""
