@@ -33,6 +33,7 @@ nav:
       - env: api/env.md
       - proxy: api/proxy.md
       - client: api/client.md
+      - negotiate: api/negotiate.md
       - jar: api/jar.md
       - cookies: api/cookies.md
       - hooks: api/hooks.md

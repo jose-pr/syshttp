@@ -15,7 +15,7 @@ response = fetch("https://example.com/", cookies=True, tokens=True)
 print(response.status, response.headers["Content-Type"])
 ```
 
-- [Settings](settings.md): the variables, their prefix, and `HTTPEnv`.
+- [Settings](settings.md): the variables, their prefix, `HTTPEnv`, and Negotiate and NTLM.
 - API reference: one page per module, in the navigation.
 - [Changelog](changelog.md).
 

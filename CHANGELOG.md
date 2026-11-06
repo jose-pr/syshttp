@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `syshttp.negotiate`: Negotiate (SPNEGO) and NTLM authentication for the
+  default transport, so `HTTPClient`, `fetch()` and `HTTPTransport` answer a
+  `401` with `WWW-Authenticate: Negotiate` or `NTLM` and a `407` with
+  `Proxy-Authenticate` (a `CONNECT` the proxy challenges included), leg after
+  leg on the connection the challenge came on, with `Connection: keep-alive`.
+  It is off until `SYSHTTP_NEGOTIATE` (servers) or `SYSHTTP_PROXY_NEGOTIATE`
+  (proxies) names a host (`*.suffix` and `*` allowed), or `Negotiate(hosts,
+  proxies, *, username, password, plain_http, max_legs, max_token, env)` is
+  passed as `negotiate=` to `HTTPClient` or `HTTPTransport`. The identity is the
+  Windows logon session (SSPI) or the Kerberos credential cache, or
+  `SYSHTTP_NEGOTIATE_USER` and `SYSHTTP_NEGOTIATE_PASSWORD`; a password is in no
+  `repr()`, log line or message. A token is not sent over plain http to a host
+  that is not loopback unless `SYSHTTP_NEGOTIATE_PLAIN_HTTP` allows it, which
+  is logged as a weakening; `SYSHTTP_NEGOTIATE_MAX_LEGS` (default 5) and
+  `SYSHTTP_NEGOTIATE_MAX_TOKEN` (default 65536) bound a handshake. A server's
+  closing token is checked where the mechanism has mutual authentication. Skipped
+  for a request that names its own `Authorization`, a proxy with a credential of
+  its own, a body that cannot be sent twice and a gateway.
+- The extras `negotiate` (pyspnego: SSPI on Windows, NTLM in Python) and
+  `kerberos` (pyspnego with `gssapi`, for the credential cache on Linux and
+  macOS). `import syshttp` and a default install load and need neither.
+- `NegotiationError` (a handshake that failed: credentials refused, a token that
+  is not valid or too large, a connection closed or more legs than allowed, a
+  handshake that would cross plain http) and `NegotiateUnavailableError` (also an
+  `ImportError`: the extra is missing or does not import), both under
+  `SysHTTPError` and exported from the root; `has_negotiate()` says whether the
+  library imports.
+
 ## [0.1.0] - 2026-10-20
 
 ### Added

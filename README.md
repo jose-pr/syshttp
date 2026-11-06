@@ -59,6 +59,14 @@ it. Documentation: <https://jose-pr.github.io/syshttp/>.
   all of the above, on `http.client` and `ssl` alone. Its transport is
   replaceable: any object with `send()` (a `requests` or `httpx` one, a fake
   in a test), chosen per client or by `SYSHTTP_DEFAULT_TRANSPORT`.
+- **Negotiate and NTLM, for the servers and proxies you name** — a `401` with
+  `WWW-Authenticate: Negotiate` or `NTLM`, and a `407` with `Proxy-Authenticate`
+  (a `CONNECT` included), is answered leg after leg on the connection it came
+  on: SSPI with the current Windows logon, Kerberos from the credential cache
+  where `gssapi` is installed, NTLM with a credential you give. Off until
+  `SYSHTTP_NEGOTIATE` or `SYSHTTP_PROXY_NEGOTIATE` names a host, and never over
+  plain http to a host that is not loopback unless a setting says so
+  (`pip install "syshttp[negotiate]"`).
 - **Other programs' clients, patched on import** — `SYSHTTP_IMPORTPATCH=1`
   (or `requests:urllib:httpx:aiohttp:pip`) makes those libraries route and
   verify the same way in any program of the environment, through
@@ -74,6 +82,8 @@ pip install syshttp
 | Extra | Adds | Needed for |
 | --- | --- | --- |
 | `pac` | a JavaScript engine for proxylib | PAC scripts proxylib evaluates itself (Linux without libproxy) |
+| `negotiate` | pyspnego | Negotiate and NTLM for a server or proxy that challenges: SSPI on Windows, NTLM in Python elsewhere |
+| `kerberos` | pyspnego with `gssapi` | Kerberos from the credential cache on Linux and macOS (builds against the system's Kerberos headers when no wheel exists) |
 
 syshttp depends on proxylib (the system proxy), sslcontext (the system's
 TLS client: the OS verifier through truststore on Python 3.10+, OpenSSL over
@@ -110,6 +120,21 @@ with HTTPClient(cookies=True, tokens=True) as client:
     response = client.request("GET", "https://api.example.com/thing")
 ```
 
+A server or proxy behind Windows-integrated authentication, answered with the
+logon session (nothing is sent unless the host is named; needs
+`pip install "syshttp[negotiate]"`):
+
+```python
+from syshttp.client import HTTPClient
+from syshttp.negotiate import Negotiate
+
+with HTTPClient(negotiate=Negotiate("wiki.corp.example", proxies="proxy.corp.example")) as client:
+    response = client.request("GET", "https://wiki.corp.example/api/page")
+```
+
+The same from the environment, with no code change:
+`SYSHTTP_NEGOTIATE=wiki.corp.example SYSHTTP_PROXY_NEGOTIATE=proxy.corp.example`.
+
 A separate configuration, isolated from the process environment:
 
 ```python
@@ -126,6 +151,7 @@ response = fetch("https://api.example.com/thing", env=env)
 | `syshttp.env` | `HTTPEnv`: the prefixes and mapping every setting is read from |
 | `syshttp.proxy` | `proxy_map()`: the settings as one proxylib proxy map |
 | `syshttp.client` | `HTTPClient` and `fetch()`: the HTTP client, its transport protocol and response |
+| `syshttp.negotiate` | `Negotiate`: which servers and proxies get Negotiate and NTLM, and with whose credentials |
 | `syshttp.jar` | file and memory cookie/token jars |
 | `syshttp.cookies` | Netscape cookie files and curl's cookie rules |
 | `syshttp.hooks` | URL hooks declared in the environment |
@@ -148,6 +174,11 @@ full list is on the docs site:
 | `SYSHTTP_PROXY_AUTH` | the proxy credential, sent verbatim; else `HTTP_PROXY_AUTH` |
 | `SYSHTTP_PROXY_AUTH_HEADER` | the header it is sent in (default `Proxy-Authorization`) |
 | `SYSHTTP_PROXY_TYPE` | `connect` (default) or `prefix[:/endpoint]` |
+| `SYSHTTP_NEGOTIATE` | the servers whose Negotiate or NTLM challenge is answered: host names, `*.suffix`, `*` (default: none) |
+| `SYSHTTP_PROXY_NEGOTIATE` | the same for proxies, by the proxy's host |
+| `SYSHTTP_NEGOTIATE_USER`, `SYSHTTP_NEGOTIATE_PASSWORD` | an explicit identity (a secret) instead of the logon session or credential cache |
+| `SYSHTTP_NEGOTIATE_PLAIN_HTTP` | also authenticate over plain http to a host that is not loopback (off; logged as a weakening) |
+| `SYSHTTP_NEGOTIATE_MAX_LEGS`, `SYSHTTP_NEGOTIATE_MAX_TOKEN` | the limits of one handshake (5 requests, 65536 bytes a token) |
 | `SYSHTTP_HOME` | the jar directory (default: the per-user state directory) |
 | `SYSHTTP_IMPORTPATCH` | `1`, or `:`-separated names: the client libraries patched on import |
 | `SYSHTTP_HOOKS_<KEY>` | a URL hook's pattern, with `_PY` / `_CURL` targets |

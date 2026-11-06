@@ -1,0 +1,3 @@
+# `syshttp.negotiate`
+
+::: syshttp.negotiate

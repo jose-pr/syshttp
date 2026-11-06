@@ -17,6 +17,12 @@ read when they are needed, never at import.
 | `SYSHTTP_PROXY_AUTH` | `SYSHTTP_PROXY`'s credential, a header value sent verbatim to it only (a secret) | the URL's userinfo as Basic |
 | `SYSHTTP_PROXY_AUTH_HEADER` | the header `SYSHTTP_PROXY_AUTH` rides in | `Proxy-Authorization` |
 | `SYSHTTP_PROXY_TYPE` | `connect`, or `prefix[:/endpoint]` for a URL-prefix gateway | `connect` |
+| `SYSHTTP_NEGOTIATE` | the servers whose `Negotiate` or `NTLM` challenge is answered: a comma list of host names, `*.suffix` for a domain, `*` for all; needs the `negotiate` extra | none |
+| `SYSHTTP_PROXY_NEGOTIATE` | the same for proxies, by the proxy's host | none |
+| `SYSHTTP_NEGOTIATE_USER`, `SYSHTTP_NEGOTIATE_PASSWORD` | an explicit identity (`DOMAIN\user` or `user@REALM`) for every allowed host; both or neither; the password is a secret | the logon session (SSPI) or the Kerberos credential cache |
+| `SYSHTTP_NEGOTIATE_PLAIN_HTTP` | whether to authenticate over plain http to a host that is not loopback (boolean); each such host is logged as a weakening | off |
+| `SYSHTTP_NEGOTIATE_MAX_LEGS` | most authenticated requests of one handshake | 5 |
+| `SYSHTTP_NEGOTIATE_MAX_TOKEN` | most bytes of one token, sent or received | 65536 |
 | `SYSHTTP_HOME` | the directory of the cookie and token jars | the per-user state directory |
 | `SYSHTTP_COOKIE_HOSTS` | groups of hosts that share cookies: hosts split by `,`, groups by `;` | none |
 | `SYSHTTP_IMPORTPATCH` | client libraries patched as they are imported to use the system proxy and TLS: `1` for all, or `:`-separated names from `requests`, `urllib`, `httpx`, `aiohttp`, `pip` | none |
@@ -95,6 +101,54 @@ aiohttp is not offered one (proxylib's `UnsupportedProxyError`). `syshttp.client
 does not send an `https:` origin through a plain `prefix+http` gateway, whose
 hop would carry that origin's tokens and Secure cookies in clear text: use an
 `https` gateway.
+
+## Negotiate and NTLM
+
+A server that answers `401` with `WWW-Authenticate: Negotiate` or `NTLM`, and a
+proxy that answers `407` with `Proxy-Authenticate` (to a `CONNECT` as well), is
+answered by `syshttp.client` only for the hosts the settings name, and only
+with the `negotiate` extra installed:
+
+```sh
+pip install "syshttp[negotiate]"
+SYSHTTP_NEGOTIATE="wiki.corp.example,*.apps.corp.example"
+SYSHTTP_PROXY_NEGOTIATE="proxy.corp.example"
+```
+
+A pattern is a host name, `*.suffix` for every host below a domain (not the
+domain itself), or `*`. With neither variable set the library never sends a
+token and a `401` or `407` is the reply, as for any other client.
+
+- **Whose identity.** With no `SYSHTTP_NEGOTIATE_USER` and
+  `SYSHTTP_NEGOTIATE_PASSWORD`, the logon session on Windows (SSPI) and the
+  Kerberos credential cache on Linux and macOS (the `kerberos` extra adds
+  `gssapi`; without it pyspnego's own NTLM needs the explicit identity). With
+  them, that one identity for every host the lists name. A password is a secret:
+  it appears in no `repr()`, log line or message, and belongs in the
+  environment or a secret store, never on a command line.
+- **The exchange.** Each leg is the same request again with a token, on the
+  connection the challenge came on and with `Connection: keep-alive`, since
+  NTLM binds the identity to the connection. The request is not answered when
+  it names an `Authorization` (a `Proxy-Authorization` for a proxy), when the
+  proxy has a credential of its own, when its body cannot be sent twice, and for
+  a prefix gateway. The server's closing token is checked where the mechanism
+  has one (Kerberos); NTLM has none.
+- **Plain http.** A token crossing plain http is not tried for a host that is
+  not loopback, and the request fails with `NegotiationError` naming
+  `SYSHTTP_NEGOTIATE_PLAIN_HTTP`. Setting it to `1` allows it, and each such
+  host is logged once as `weakened` under the `syshttp.client` logger. An
+  `https:` server is judged by its own scheme; a proxy by the proxy URL's.
+- **Limits and failures.** `SYSHTTP_NEGOTIATE_MAX_LEGS` bounds the
+  authenticated requests of one handshake (NTLM takes two) and
+  `SYSHTTP_NEGOTIATE_MAX_TOKEN` a token in either direction. Refused
+  credentials, a token that is not valid, a closed connection, a limit and a
+  failure of the library raise `NegotiationError`, once: nothing is sent again.
+  The extra missing raises `NegotiateUnavailableError`, which is also an
+  `ImportError`, only for a host the settings name.
+
+In code, `HTTPClient(negotiate=Negotiate(...))` (or `HTTPTransport(negotiate=...)`)
+takes the same settings as arguments, which win over the variables; the
+[`syshttp.negotiate` reference](api/negotiate.md) lists them.
 
 ## The default transport
 
