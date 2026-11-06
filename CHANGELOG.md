@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-07
+
 ### Added
 
 - `syshttp.negotiate`: Negotiate (SPNEGO) and NTLM authentication for the
@@ -369,5 +371,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   longer with the userinfo, query and fragment (`user:pass@`,
   `?access_token=`).
 
-[Unreleased]: https://github.com/jose-pr/syshttp/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/jose-pr/syshttp/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/jose-pr/syshttp/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/jose-pr/syshttp/releases/tag/v0.1.0

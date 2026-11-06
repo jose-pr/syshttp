@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "syshttp"
-version = "0.1.0"
+version = "0.1.1"
 authors = [{ name = "jose-pr", email = "jose-pr@coqui.dev" }]
 description = "HTTP plumbing that follows the system: the system proxy (PAC, WPAD) and the OS certificate verifier by default, proxy credentials and prefix gateways, Netscape cookie jars, OS trust-store TLS, URL hooks, and an HTTP client on the standard library"
 readme = "README.md"
